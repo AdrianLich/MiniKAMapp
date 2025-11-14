@@ -87,64 +87,69 @@ def reorder_df_to_exact_columns(df, desired_order):
     return df.loc[:, selected_cols]
 
 # -------------------------
-# Normalización y limpieza avanzada (mejor opción)
+# Consolidación y limpieza robusta
 # -------------------------
-def normalize_column_names(df):
-    """Quitar espacios extra en nombres de columnas y normalizar ligeros duplicados."""
-    new_cols = []
-    seen = {}
-    for c in df.columns:
-        cc = re.sub(r'\s+', ' ', str(c)).strip()
-        if cc in seen:
-            seen[cc] += 1
-            cc = f"{cc}_{seen[cc]}"
-        else:
-            seen[cc] = 0
-        new_cols.append(cc)
-    df.columns = new_cols
+def consolidate_duplicate_columns(df, canonical_names_map=None):
+    norm_map = {}
+    order = list(df.columns)
+    for col in order:
+        key = re.sub(r'\s+', ' ', str(col)).strip().lower()
+        key = re.sub(r'[_\s]+', ' ', key)
+        norm_map.setdefault(key, []).append(col)
+
+    for key, cols in norm_map.items():
+        if len(cols) <= 1:
+            continue
+
+        counts = {}
+        for c in cols:
+            try:
+                ser = df[c]
+                non_blank = (~ser.isna()) & (ser.astype(str).str.strip() != "")
+                counts[c] = int(non_blank.sum())
+            except Exception:
+                counts[c] = 0
+
+        winner = max(cols, key=lambda x: (counts.get(x, 0), -cols.index(x)))
+
+        canonical_display = None
+        if canonical_names_map:
+            if key in canonical_names_map:
+                canonical_display = canonical_names_map[key]
+
+        if not canonical_display:
+            canonical_display = re.sub(r'\s+', ' ', str(winner)).strip()
+
+        if canonical_display in df.columns and canonical_display != winner:
+            try:
+                existing_nonblank = ((~df[canonical_display].isna()) & (df[canonical_display].astype(str).str.strip() != "")).any()
+            except Exception:
+                existing_nonblank = False
+            if not existing_nonblank:
+                df.rename(columns={canonical_display: canonical_display + "_old_empty"}, inplace=True)
+            else:
+                winner = canonical_display
+
+        if winner != canonical_display:
+            df.rename(columns={winner: canonical_display}, inplace=True)
+            winner = canonical_display
+
+        losers = [c for c in cols if c != winner and c in df.columns]
+        if losers:
+            df.drop(columns=losers, inplace=True)
+
     return df
 
-def drop_empty_excel_positions(df, positions_1based):
-    """
-    Borra columnas que estén en las posiciones Excel indicadas (1-based),
-    solo si están vacías (todos NaN o cadenas vacías).
-    Borra en orden descendente para no desajustar índices intermedios.
-    """
-    for pos in sorted(positions_1based, reverse=True):
-        idx = pos - 1
-        if idx < 0 or idx >= len(df.columns):
-            continue
-        colname = df.columns[idx]
-        try:
-            ser = df[colname]
-            all_na = ser.isna().all()
-            all_blank_str = False
-            if not all_na:
-                all_blank_str = (ser.astype(str).str.strip() == "").all()
-        except Exception:
-            all_na = False
-            all_blank_str = False
-
-        if all_na or all_blank_str:
-            df.drop(columns=[colname], inplace=True)
-
 def canonicalize_and_drop(df):
-    """
-    - Normaliza nombres
-    - Renombra variantes conocidas a nombres canónicos
-    - Elimina columnas por nombre si están totalmente vacías
-    - Fallback: elimina por posiciones Excel si aún quedan columnas vacías en esas posiciones
-    """
-    # 1) Normalizar espacios
     df.columns = [re.sub(r'\s+', ' ', str(c)).strip() for c in df.columns]
 
-    # 2) Renombrar variantes a canónicos
     rename_map = {
         "Costo de  oferta": "Costo de oferta",
         "Valor del anaquel  por SKU": "Valor del anaquel por SKU",
         "URL Imagen": "imagen_url",
         "URL_Imagen": "imagen_url",
         "URLImagen": "imagen_url",
+        "URL Imagen_0": "imagen_url",
         "Valor del anaquel por SKU_1": "Valor del anaquel por SKU",
         "Precio de la Competencia_1": "Precio de la Competencia"
     }
@@ -152,11 +157,9 @@ def canonicalize_and_drop(df):
     if existing_map:
         df.rename(columns=existing_map, inplace=True)
 
-    # 3) Borrar por nombres si están vacíos
     names_to_check = [
         "Costo de oferta", "precio_comp", "Precio de la Competencia", "imagen_url",
-        "Valor del anaquel por SKU", "Costo de  oferta", "Valor del anaquel  por SKU",
-        "URL Imagen", "URL Imagen_0", "URL_Imagen"
+        "Valor del anaquel por SKU", "URL Imagen", "URL_Imagen", "URLImagen", "URL Imagen_0"
     ]
     for name in names_to_check:
         if name in df.columns:
@@ -170,10 +173,57 @@ def canonicalize_and_drop(df):
             if all_na or all_blank:
                 df.drop(columns=[name], inplace=True)
 
-    # 4) Fallback por posiciones (si aún persisten columnas vacías en posiciones clave)
-    positions_to_drop = [16, 17, 33, 38]  # P, Q, AG, AL
-    drop_empty_excel_positions(df, positions_to_drop)
+    positions_to_drop = [16, 17, 33, 38]  # fallback P,Q,AG,AL
+    for pos in sorted(positions_to_drop, reverse=True):
+        idx = pos - 1
+        if 0 <= idx < len(df.columns):
+            colname = df.columns[idx]
+            try:
+                ser = df[colname]
+                all_na = ser.isna().all()
+                all_blank = (ser.astype(str).str.strip() == "").all()
+            except Exception:
+                all_na = False
+                all_blank = False
+            if all_na or all_blank:
+                df.drop(columns=[colname], inplace=True)
 
+    return df
+
+# canonical names map sugerido
+canonical_map = {
+    "costo de oferta": "Costo de oferta",
+    "costo de  oferta": "Costo de oferta",
+    "precio_comp": "precio_comp",
+    "precio comp": "precio_comp",
+    "precio de la competencia": "Precio de la Competencia",
+    "valor del anaquel por sku": "Valor del anaquel por SKU",
+    "valor del anaquel  por sku": "Valor del anaquel por SKU",
+    "imagen_url": "imagen_url",
+    "url imagen": "imagen_url",
+    "url_imagen": "imagen_url",
+    "url imagen_0": "imagen_url"
+}
+
+# -------------------------
+# Mover/insertar columna a posición Excel (1-based)
+# -------------------------
+def move_column_to_position(df, col_name, pos_1based):
+    if not isinstance(pos_1based, int) or pos_1based < 1:
+        raise ValueError("pos_1based debe ser entero >= 1")
+
+    if col_name in df.columns:
+        series = df.pop(col_name)
+    else:
+        series = pd.Series([pd.NA] * len(df), name=col_name)
+
+    insert_idx = pos_1based - 1
+    if insert_idx < 0:
+        insert_idx = 0
+    if insert_idx > len(df.columns):
+        insert_idx = len(df.columns)
+
+    df.insert(insert_idx, col_name, series)
     return df
 
 # -------------------------
@@ -223,7 +273,6 @@ df_comp = df_comp.copy()
 df_comp.columns = df_comp.columns.str.strip()
 cols = df_comp.columns.tolist()
 
-# detectar columnas flexibles
 col_url = next((c for c in cols if 'url' in c.lower() and ('producto' in c.lower() or 'product' in c.lower())), None)
 if not col_url:
     col_url = next((c for c in cols if 'url' in c.lower()), None)
@@ -232,7 +281,6 @@ col_img = next((c for c in cols if 'imagen' in c.lower() or 'img' in c.lower()),
 col_nombre = next((c for c in cols if 'nombre' in c.lower() or 'producto' in c.lower() or 'descripcion' in c.lower()), None)
 col_precio = next((c for c in cols if 'precio' in c.lower() or 'mxn' in c.lower()), None)
 
-# Enriquecimiento robusto
 if col_url:
     df_comp["codigo_desde_url"] = df_comp[col_url].astype(str).fillna("").apply(extraer_codigo_mas_largo)
     df_comp["competidor"] = df_comp[col_url].astype(str).fillna("").apply(detectar_competidor_desde_url)
@@ -312,7 +360,7 @@ except Exception as e:
     st.stop()
 
 # -------------------------
-# Orden deseado (exacto) — copia literal de tu lista
+# Orden deseado (exacto)
 # -------------------------
 desired_order = [
     "Marca", "Proveedor", "Categoria", "Sub categoria", "Segmento 1", "Codigo",
@@ -327,7 +375,7 @@ desired_order = [
 ]
 
 # -------------------------
-# Cruce automático y generación de Excel
+# Cruce y generación de Excel
 # -------------------------
 buffer = BytesIO()
 hojas_generadas = 0
@@ -335,11 +383,9 @@ timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 file_name = f"MiniKam_Comparativo_{timestamp}.xlsx"
 
 with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
-    # 1) hoja de inicio mínima
     pd.DataFrame({"Info": ["Archivo generado por MiniKAM - inicio"]}).to_excel(writer, sheet_name="Inicio", index=False)
     hojas_generadas += 1
 
-    # 2) generar hojas por competidor desde df_comp enriquecido
     for comp in sorted(competidores):
         if not comp or str(comp).strip() == "":
             continue
@@ -347,7 +393,6 @@ with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
         if df_competidor.empty:
             continue
 
-        # unir por Codigo y por nombre limpio
         df_codigo = pd.merge(
             df_datos,
             df_competidor[["codigo_extraido", "precio_comp", "imagen_url"]].drop_duplicates(),
@@ -369,15 +414,18 @@ with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
             axis=1
         )
 
-        # Reordenar columnas según tu lista exacta antes de escribir
         try:
             df_final_reordered = reorder_df_to_exact_columns(df_final.copy(), desired_order)
         except Exception as e:
             st.warning(f"Advertencia al reordenar columnas para {comp}: {e}. Se usará el orden por defecto.")
             df_final_reordered = df_final
 
-        # Normalizar, renombrar variantes y eliminar columnas vacías (por nombre y fallback por posición)
+        # Consolidar duplicados y limpiar
+        df_final_reordered = consolidate_duplicate_columns(df_final_reordered, canonical_map)
         df_final_reordered = canonicalize_and_drop(df_final_reordered)
+
+        # mover 'Valor del anaquel por SKU' a columna U (pos 21)
+        df_final_reordered = move_column_to_position(df_final_reordered, "Valor del anaquel por SKU", 21)
 
         if not df_final_reordered.empty:
             safe_name = (str(comp) or "competidor")[:31]
@@ -389,7 +437,7 @@ with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
             df_final_reordered.to_excel(writer, sheet_name=sheet_name, index=False)
             hojas_generadas += 1
 
-    # 3) incluir MiniKam Original en el mismo orden
+    # MiniKam Original
     try:
         if df_datos.shape[0] > 0 and df_datos.shape[1] > 0:
             base_name = "MiniKam Original"
@@ -401,16 +449,20 @@ with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
 
             try:
                 df_datos_reordered = reorder_df_to_exact_columns(df_datos.copy(), desired_order)
+                df_datos_reordered = consolidate_duplicate_columns(df_datos_reordered, canonical_map)
                 df_datos_reordered = canonicalize_and_drop(df_datos_reordered)
+
+                # mover 'Valor del anaquel por SKU' a columna U (pos 21) en MiniKam Original
+                df_datos_reordered = move_column_to_position(df_datos_reordered, "Valor del anaquel por SKU", 21)
+
                 df_datos_reordered.to_excel(writer, sheet_name=name_try, index=False)
                 hojas_generadas += 1
-            except Exception as e:
+            except Exception:
                 df_datos.to_excel(writer, sheet_name=name_try, index=False)
                 hojas_generadas += 1
     except Exception:
         pass
 
-    # 4) fallback diagnóstico si sólo quedó "Inicio"
     if hojas_generadas <= 1:
         diag = {
             "Mensaje": ["No se generaron hojas de competidor con datos. Revisa archivos subidos."],
@@ -427,9 +479,6 @@ buffer.seek(0)
 st.success("✅ Archivo comparativo generado (o hoja NoData si no hubo coincidencias).")
 st.download_button("📥 Descargar archivo Excel", buffer, file_name=file_name, mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
-# -------------------------
-# Resumen en pantalla
-# -------------------------
 st.subheader("Resumen rápido")
 st.write(f"- Productos en MiniKam: {len(df_datos)}")
 st.write(f"- Filas en competencia (enriquecidas): {len(df_comp)}")
