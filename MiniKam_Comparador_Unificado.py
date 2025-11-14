@@ -41,7 +41,7 @@ def detectar_competidor_desde_url(url: str) -> str:
         return ""
 
 # -------------------------
-# Reordenamiento robusto: empareja columnas y asegura el orden solicitado
+# Reordenamiento robusto
 # -------------------------
 def norm(s):
     if s is None:
@@ -85,6 +85,96 @@ def reorder_df_to_exact_columns(df, desired_order):
             selected_cols.append(c)
 
     return df.loc[:, selected_cols]
+
+# -------------------------
+# Normalización y limpieza avanzada (mejor opción)
+# -------------------------
+def normalize_column_names(df):
+    """Quitar espacios extra en nombres de columnas y normalizar ligeros duplicados."""
+    new_cols = []
+    seen = {}
+    for c in df.columns:
+        cc = re.sub(r'\s+', ' ', str(c)).strip()
+        if cc in seen:
+            seen[cc] += 1
+            cc = f"{cc}_{seen[cc]}"
+        else:
+            seen[cc] = 0
+        new_cols.append(cc)
+    df.columns = new_cols
+    return df
+
+def drop_empty_excel_positions(df, positions_1based):
+    """
+    Borra columnas que estén en las posiciones Excel indicadas (1-based),
+    solo si están vacías (todos NaN o cadenas vacías).
+    Borra en orden descendente para no desajustar índices intermedios.
+    """
+    for pos in sorted(positions_1based, reverse=True):
+        idx = pos - 1
+        if idx < 0 or idx >= len(df.columns):
+            continue
+        colname = df.columns[idx]
+        try:
+            ser = df[colname]
+            all_na = ser.isna().all()
+            all_blank_str = False
+            if not all_na:
+                all_blank_str = (ser.astype(str).str.strip() == "").all()
+        except Exception:
+            all_na = False
+            all_blank_str = False
+
+        if all_na or all_blank_str:
+            df.drop(columns=[colname], inplace=True)
+
+def canonicalize_and_drop(df):
+    """
+    - Normaliza nombres
+    - Renombra variantes conocidas a nombres canónicos
+    - Elimina columnas por nombre si están totalmente vacías
+    - Fallback: elimina por posiciones Excel si aún quedan columnas vacías en esas posiciones
+    """
+    # 1) Normalizar espacios
+    df.columns = [re.sub(r'\s+', ' ', str(c)).strip() for c in df.columns]
+
+    # 2) Renombrar variantes a canónicos
+    rename_map = {
+        "Costo de  oferta": "Costo de oferta",
+        "Valor del anaquel  por SKU": "Valor del anaquel por SKU",
+        "URL Imagen": "imagen_url",
+        "URL_Imagen": "imagen_url",
+        "URLImagen": "imagen_url",
+        "Valor del anaquel por SKU_1": "Valor del anaquel por SKU",
+        "Precio de la Competencia_1": "Precio de la Competencia"
+    }
+    existing_map = {k: v for k, v in rename_map.items() if k in df.columns}
+    if existing_map:
+        df.rename(columns=existing_map, inplace=True)
+
+    # 3) Borrar por nombres si están vacíos
+    names_to_check = [
+        "Costo de oferta", "precio_comp", "Precio de la Competencia", "imagen_url",
+        "Valor del anaquel por SKU", "Costo de  oferta", "Valor del anaquel  por SKU",
+        "URL Imagen", "URL Imagen_0", "URL_Imagen"
+    ]
+    for name in names_to_check:
+        if name in df.columns:
+            ser = df[name]
+            try:
+                all_na = ser.isna().all()
+                all_blank = (ser.astype(str).str.strip() == "").all()
+            except Exception:
+                all_na = False
+                all_blank = False
+            if all_na or all_blank:
+                df.drop(columns=[name], inplace=True)
+
+    # 4) Fallback por posiciones (si aún persisten columnas vacías en posiciones clave)
+    positions_to_drop = [16, 17, 33, 38]  # P, Q, AG, AL
+    drop_empty_excel_positions(df, positions_to_drop)
+
+    return df
 
 # -------------------------
 # Uploads
@@ -286,6 +376,9 @@ with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
             st.warning(f"Advertencia al reordenar columnas para {comp}: {e}. Se usará el orden por defecto.")
             df_final_reordered = df_final
 
+        # Normalizar, renombrar variantes y eliminar columnas vacías (por nombre y fallback por posición)
+        df_final_reordered = canonicalize_and_drop(df_final_reordered)
+
         if not df_final_reordered.empty:
             safe_name = (str(comp) or "competidor")[:31]
             sheet_name = safe_name
@@ -308,10 +401,10 @@ with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
 
             try:
                 df_datos_reordered = reorder_df_to_exact_columns(df_datos.copy(), desired_order)
+                df_datos_reordered = canonicalize_and_drop(df_datos_reordered)
                 df_datos_reordered.to_excel(writer, sheet_name=name_try, index=False)
                 hojas_generadas += 1
             except Exception as e:
-                # fallback
                 df_datos.to_excel(writer, sheet_name=name_try, index=False)
                 hojas_generadas += 1
     except Exception:
